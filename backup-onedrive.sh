@@ -1,12 +1,12 @@
 #!/usr/bin/env bash
-# Backup do dia anterior para o OneDrive correspondente (dias pares → diasPares, dias ímpares → diasImpar)
+# Backup do dia anterior para o OneDrive correspondente (dias pares → diasPares, dias ímpares → diaImpar)
 # Agendado para rodar às 00:10 via cron.
 
 set -euo pipefail
 
 RECORDINGS_DIR="/home/usua1/frigate/storage/recordings"
 LOG_DIR="/var/log/bkp-onedrive"
-RCLONE_FLAGS="--transfers=8 --checkers=16 --progress --log-level INFO"
+RCLONE_FLAGS="--transfers=8 --checkers=16 --log-level INFO"
 
 # Dia anterior
 YESTERDAY=$(date -d "yesterday" +%Y-%m-%d)
@@ -16,7 +16,7 @@ DAY_NUMBER=$(date -d "yesterday" +%-d)   # sem zero à esquerda
 if (( DAY_NUMBER % 2 == 0 )); then
     REMOTE="diasPares"
 else
-    REMOTE="diasImpar"
+    REMOTE="diaImpar"
 fi
 
 SOURCE="${RECORDINGS_DIR}/${YESTERDAY}"

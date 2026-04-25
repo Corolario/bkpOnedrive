@@ -6,14 +6,14 @@ Faz backup automático das gravações do Frigate para duas contas OneDrive (1 T
 
 - `rclone` instalado e configurado com dois remotes:
   - **`diasPares`** — conta OneDrive para dias pares (2, 4, 6…)
-  - **`diasImpar`** — conta OneDrive para dias ímpares (1, 3, 5…)
+  - **`diaImpar`** — conta OneDrive para dias ímpares (1, 3, 5…)
 
 ### Configurar os remotes
 
 ```bash
 rclone config
 # Siga o assistente para criar um remote "diasPares" (OneDrive)
-# Repita para criar o remote "diasImpar"
+# Repita para criar o remote "diaImpar"
 ```
 
 Confirme os remotes criados:
@@ -41,7 +41,7 @@ chmod 644 /etc/cron.d/bkp-onedrive
 ```
 /home/usua1/frigate/storage/recordings/
 ├── 2026-04-22/   ← dia par  → diasPares
-├── 2026-04-23/   ← dia ímpar → diasImpar
+├── 2026-04-23/   ← dia ímpar → diaImpar
 └── 2026-04-24/   ← dia par  → diasPares
 ```
 
