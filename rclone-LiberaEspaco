@@ -1,0 +1,166 @@
+#!/usr/bin/env bash
+#
+# rclone-limpa.sh
+# Mantém o espaço livre em um remote do rclone acima de um limite mínimo,
+# removendo a(s) pasta(s) datada(s) (YYYY-MM-DD) mais antiga(s) até voltar
+# acima do threshold.
+#
+# Uso:
+#   ./rclone-limpa.sh <remote:[caminho]>
+#   ./rclone-limpa.sh diasPares:recordings
+#   DRY_RUN=1 ./rclone-limpa.sh diasPares:recordings   # apenas simula
+#
+# Variável de ambiente reconhecida:
+#   DRY_RUN   1 = simula, não apaga nada (padrão: 0)
+#
+# Pode ser chamado pelo script de backup antes do 'rclone copy' para
+# garantir espaço, ou agendado no cron de forma independente.
+
+set -euo pipefail
+
+# PATH explícito — cron herda um PATH mínimo.
+export PATH="/usr/local/bin:/usr/bin:/bin"
+
+# ---- Configuração ----------------------------------------------------------
+THRESHOLD_GB=200     # limite mínimo de espaço livre (GB)
+MIN_KEEP_DIRS=1      # nunca apaga abaixo deste número de pastas datadas
+MAX_ITERATIONS=30    # teto de segurança no loop
+
+# ---- Funções de log --------------------------------------------------------
+ts()  { date '+%Y-%m-%d %H:%M:%S'; }
+log() { printf '[%s] %s\n' "$(ts)" "$*"; }
+err() { printf '[%s] ERRO: %s\n' "$(ts)" "$*" >&2; }
+
+usage() {
+    printf 'Uso: %s <remote:[caminho]>\n\nExemplos:\n  %s diasPares:recordings\n  DRY_RUN=1 %s diasPares:recordings\n' "$0" "$0" "$0" >&2
+}
+
+# ---- Argumentos ------------------------------------------------------------
+if [[ $# -lt 1 || -z "${1:-}" || "${1:-}" == "-h" || "${1:-}" == "--help" ]]; then
+    usage
+    exit 1
+fi
+REMOTE="$1"
+
+DRY_RUN="${DRY_RUN:-0}"
+
+# Lockfile por remote — cleanups de remotes distintos podem rodar em paralelo.
+REMOTE_TAG="${REMOTE//[:\/]/_}"
+LOCKFILE="/tmp/rclone-cleanup-${REMOTE_TAG}.lock"
+
+# ---- Lock (evita execuções sobrepostas) ------------------------------------
+if [[ "${LOCKED:-}" != "1" ]]; then
+    exec env LOCKED=1 flock -n "$LOCKFILE" "$0" "$@" || {
+        err "outra instância já está rodando (lock: $LOCKFILE). Saindo."
+        exit 0
+    }
+fi
+
+# ---- Pré-requisitos --------------------------------------------------------
+for cmd in rclone jq awk flock sort grep sed; do
+    if ! command -v "$cmd" >/dev/null 2>&1; then
+        err "comando obrigatório não encontrado: $cmd"
+        exit 1
+    fi
+done
+
+# ---- Normalização do remote/caminho ----------------------------------------
+# Separa em dois conceitos:
+#   BARE_REMOTE -> usado em 'rclone about' (reporta a quota do backend; ignora path)
+#   BASE_PATH   -> usado em 'lsf' e 'purge' (raiz onde ficam as pastas datadas)
+#
+# Casos cobertos:
+#   diasPares             -> BARE=diasPares:           BASE=diasPares:
+#   diasPares:            -> BARE=diasPares:           BASE=diasPares:
+#   diasPares:recordings  -> BARE=diasPares:           BASE=diasPares:recordings/
+#   diasPares:a/b/        -> BARE=diasPares:           BASE=diasPares:a/b/
+if [[ "$REMOTE" != *:* ]]; then
+    BARE_REMOTE="${REMOTE}:"
+    BASE_PATH="${REMOTE}:"
+else
+    BARE_REMOTE="${REMOTE%%:*}:"
+    path_part="${REMOTE#*:}"
+    if [[ -z "$path_part" ]]; then
+        BASE_PATH="$BARE_REMOTE"
+    else
+        BASE_PATH="${BARE_REMOTE}${path_part%/}/"
+    fi
+fi
+
+log "Iniciando cleanup"
+log "  remote (about):      ${BARE_REMOTE}"
+log "  caminho (lsf/purge): ${BASE_PATH}"
+log "  threshold: ${THRESHOLD_GB} GB | manter no mínimo: ${MIN_KEEP_DIRS} pasta(s) | dry-run: ${DRY_RUN}"
+
+# ---- Lista pastas datadas (mais antiga primeiro) ---------------------------
+list_dated_dirs() {
+    rclone lsf "$BASE_PATH" --dirs-only 2>/dev/null \
+        | sed 's:/$::' \
+        | grep -E '^[0-9]{4}-[0-9]{2}-[0-9]{2}$' \
+        | sort \
+        || true
+}
+
+# ---- Loop principal --------------------------------------------------------
+iter=0
+while (( iter < MAX_ITERATIONS )); do
+    if ! ABOUT_JSON=$(rclone about "$BARE_REMOTE" --json 2>/dev/null); then
+        err "falha ao executar 'rclone about $BARE_REMOTE'"
+        exit 1
+    fi
+
+    FREE_GB=$(printf '%s' "$ABOUT_JSON" \
+        | jq -r '.free // empty' \
+        | awk '{ printf "%d\n", $1 / 1024 / 1024 / 1024 }')
+
+    if ! [[ "$FREE_GB" =~ ^[0-9]+$ ]]; then
+        err "valor de espaço livre inválido ou ausente: '$FREE_GB'"
+        exit 1
+    fi
+
+    log "Iter ${iter} — livre: ${FREE_GB} GB (limite: ${THRESHOLD_GB} GB)"
+
+    if (( FREE_GB >= THRESHOLD_GB )); then
+        log "Espaço suficiente. Cleanup concluído."
+        exit 0
+    fi
+
+    log "Abaixo do limite. Procurando pasta datada mais antiga em ${BASE_PATH}..."
+
+    mapfile -t DIRS < <(list_dated_dirs)
+    TOTAL="${#DIRS[@]}"
+
+    if (( TOTAL == 0 )); then
+        err "Nenhuma pasta no formato YYYY-MM-DD encontrada em ${BASE_PATH}."
+        exit 1
+    fi
+
+    OLDEST_DIR="${DIRS[0]}"
+    NEWEST_DIR="${DIRS[TOTAL-1]}"
+    TARGET="${BASE_PATH}${OLDEST_DIR}"
+
+    if (( TOTAL <= MIN_KEEP_DIRS )); then
+        err "Restam apenas ${TOTAL} pasta(s) datada(s); mínimo a manter é ${MIN_KEEP_DIRS}."
+        err "Não vou apagar mais. Espaço ainda abaixo do limite — verifique manualmente."
+        exit 1
+    fi
+
+    if [[ "$DRY_RUN" == "1" ]]; then
+        log "[DRY-RUN] ${TOTAL} pasta(s) datada(s): de ${OLDEST_DIR} até ${NEWEST_DIR}"
+        log "[DRY-RUN] Próximo alvo seria: rclone purge ${TARGET}"
+        log "[DRY-RUN] (Não dá para simular a evolução do espaço livre; encerrando após o 1º alvo.)"
+        exit 0
+    fi
+
+    log "Removendo: ${TARGET}"
+    # O OneDrive frequentemente retorna itemNotFound ao confirmar a exclusão,
+    # mesmo tendo apagado com sucesso. Por isso ignoramos o exit code do purge
+    # e verificamos o resultado na próxima iteração via 'rclone about'.
+    rclone purge "$TARGET" || true
+    log "Purge executado: ${TARGET} (resultado confirmado na próxima iteração)"
+
+    iter=$((iter + 1))
+done
+
+err "Atingido MAX_ITERATIONS=${MAX_ITERATIONS} sem voltar ao limite. Verifique manualmente."
+exit 1
